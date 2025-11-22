@@ -1,39 +1,40 @@
-# -*- coding: utf-8 -*-
+import json
 import logging
-import os
 from datetime import datetime, timedelta
 
 from telegram import (
-    Update,
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    Update,
 )
 from telegram.ext import (
     Updater,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    Filters,
-    PreCheckoutQueryHandler,
     CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    Filters,
+    MessageHandler,
+    PreCheckoutQueryHandler,
 )
 
-# =========================
-# إعدادات أساسية
-# =========================
+# ============== إعدادات أساسية ==============
 
-# حط توكن البوت تبعك هون
+# حط توكن بوتك هنا
 BOT_TOKEN = "8307758081:AAGRFcucb0XLWe6TEJAOX0qFFlMFYBpKSYY"
 
-# ID القناة الخاصة اللي بدك تبعت منها رابط الدعوة (لازم البوت يكون أدمن فيها)
+# ID القناة الخاصة اللي بدك تربط فيها الدعوات (لازم يكون البوت أدمن بالقناة)
 # مثال: -1001234567890
 CHANNEL_ID = -1002547907056
 
-# أرقام الـ ID تبع المشرفين اللي لهم صلاحية /admin
-ADMIN_IDS = {6671972850}  # حط الـ user_id تبعك هون
+# أرقام ID للمشرفين اللي لهم صلاحية /admin
+ADMIN_IDS = {6671972850}
 
-# تعريف الخطط (تقدر تعدّل الأيام والسعر براحتك)
+# ملف لتخزين المشتركين محلياً
+DATA_FILE = "subscriptions.json"
+
+# تعريف الخطط (تقدر تعدل الأيام والسعر براحتك)
 PLANS = {
     "weekly": {
         "name": "اشتراك أسبوعي",
@@ -47,280 +48,377 @@ PLANS = {
     },
     "lifetime": {
         "name": "اشتراك دائم",
-        "days": 3650,  # عملياً دائم
+        "days": 0,  # 0 يعني اشتراك دائم بدون انتهاء
         "price_stars": 10,
     },
 }
 
-# تخزين بسيط للاشتراكات في الذاكرة
-# الشكل: user_id -> {"plan_id": ..., "expires_at": datetime}
-user_subscriptions = {}
-
-# =========================
-# لوجينغ
-# =========================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# ============== أدوات مساعدة ==============
 
 
-# =========================
-# دوال مساعدة
-# =========================
+def load_data():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.exception("Failed to load data file")
+        return {}
 
-def build_main_menu() -> InlineKeyboardMarkup:
-    """لوحة الاشتراكات للمستخدم العادي."""
+
+def save_data(data):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logging.exception("Failed to save data file")
+
+
+def get_user_sub(data, user_id):
+    return data.get(str(user_id))
+
+
+def set_user_sub(data, user_id, plan_key, expires_at):
+    data[str(user_id)] = {
+        "plan": plan_key,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+    }
+    save_data(data)
+
+
+def remove_user_sub(data, user_id):
+    if str(user_id) in data:
+        del data[str(user_id)]
+        save_data(data)
+
+
+def format_expiry(expires_at_str):
+    if not expires_at_str:
+        return "دائم"
+    try:
+        dt = datetime.fromisoformat(expires_at_str)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "غير معروف"
+
+
+# ============== أوامر المستخدم ==============
+
+
+def start(update: Update, context: CallbackContext):
+    user = update.effective_user
+
     keyboard = [
         [
-            InlineKeyboardButton("📅 اشتراك أسبوعي", callback_data="plan:weekly"),
+            InlineKeyboardButton("اشتراك أسبوعي ⭐", callback_data="plan_weekly"),
         ],
         [
-            InlineKeyboardButton("📅 اشتراك شهري", callback_data="plan:monthly"),
+            InlineKeyboardButton("اشتراك شهري ⭐", callback_data="plan_monthly"),
         ],
         [
-            InlineKeyboardButton("♾️ اشتراك دائم", callback_data="plan:lifetime"),
+            InlineKeyboardButton("اشتراك دائم ⭐", callback_data="plan_lifetime"),
+        ],
+        [
+            InlineKeyboardButton("حالة اشتراكي 🔔", callback_data="my_status"),
         ],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "👋 أهلاً حبيبي.\n\n"
+        "اختر نوع الاشتراك اللي يناسبك من الأزرار تحت:\n\n"
+        "كل اشتراك يتم عن طريق Telegram Stars داخل تيليغرام.\n"
+    )
+
+    update.message.reply_text(text, reply_markup=reply_markup)
+
+
+def button(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user = query.from_user
+    data = load_data()
+
+    query.answer()
+
+    # زر حالة الاشتراك
+    if query.data == "my_status":
+        sub = get_user_sub(data, user.id)
+        if not sub:
+            query.edit_message_text("🚫 ما عندك اشتراك فعال حالياً.")
+        else:
+            plan = PLANS.get(sub["plan"], {})
+            plan_name = plan.get("name", "غير معروف")
+            expires = format_expiry(sub.get("expires_at"))
+            msg = f"🔔 حالة اشتراكك:\n\nالنوع: {plan_name}\nينتهي في: {expires}"
+            query.edit_message_text(msg)
+        return
+
+    # اختيار خطة
+    if not query.data.startswith("plan_"):
+        return
+
+    plan_key = query.data.replace("plan_", "")
+    if plan_key not in PLANS:
+        query.edit_message_text("❌ خطة غير معروفة.")
+        return
+
+    plan = PLANS[plan_key]
+
+    title = plan["name"]
+    description = f"{plan['name']} في القناة الخاصة."
+    payload = f"sub_{plan_key}"
+    currency = "XTR"  # عملة Telegram Stars
+    prices = [LabeledPrice(label=plan["name"], amount=plan["price_stars"])]
+
+    # نبعث الفاتورة للمستخدم (Telegram Stars)
+    context.bot.send_invoice(
+        chat_id=user.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",  # فاضي عشان Telegram Stars
+        currency=currency,
+        prices=prices,
+    )
+
+    query.edit_message_text(
+        f"⭐ السعر: {plan['price_stars']} نجمة.\n"
+        "رح يوصلك إشعار دفع من تيليغرام، وافق عليه لإكمال العملية. ✅"
+    )
+
+
+def precheckout_callback(update: Update, context: CallbackContext):
+    query = update.pre_checkout_query
+
+    # إذا في أي مشكلة بالدفع حط ok=False و reason
+    if not query.invoice_payload.startswith("sub_"):
+        query.answer(ok=False, error_message="🚫 نوع الدفع غير معروف.")
+        return
+
+    query.answer(ok=True)
+
+
+def successful_payment(update: Update, context: CallbackContext):
+    user = update.effective_user
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload  # مثال sub_weekly
+
+    plan_key = payload.replace("sub_", "")
+    if plan_key not in PLANS:
+        update.message.reply_text("تم الدفع، لكن الخطة غير معروفة. تواصل مع الادمن.")
+        return
+
+    plan = PLANS[plan_key]
+    data = load_data()
+
+    if plan["days"] > 0:
+        expires_at = datetime.utcnow() + timedelta(days=plan["days"])
+    else:
+        expires_at = None  # اشتراك دائم
+
+    # نخزن الاشتراك
+    set_user_sub(data, user.id, plan_key, expires_at)
+
+    # نعمل رابط دعوة للقناة ونرسله للمستخدم
+    try:
+        invite = context.bot.create_chat_invite_link(
+            chat_id=CHANNEL_ID,
+            member_limit=1,
+        )
+        link = invite.invite_link
+    except Exception:
+        logging.exception("Failed to create invite link")
+        link = None
+
+    msg_lines = [
+        "✅ تم استلام الدفع بنجاح!",
+        f"الخطة: {plan['name']}",
+    ]
+    if plan["days"] > 0:
+        msg_lines.append(f"المدة: {plan['days']} يوم")
+    else:
+        msg_lines.append("المدة: دائم")
+
+    if link:
+        msg_lines.append("")
+        msg_lines.append("اضغط الرابط لدخول القناة الخاصة:")
+        msg_lines.append(link)
+    else:
+        msg_lines.append("")
+        msg_lines.append("❗ ما قدرت أجهز رابط دعوة للقناة.")
+        msg_lines.append("تواصل مع الادمن لو ما وصلك اشتراكك.")
+
+    update.message.reply_text("\n".join(msg_lines))
+
+
+# ============== لوحة تحكم الادمن ==============
 
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def get_user_sub_info(user_id: int):
-    info = user_subscriptions.get(user_id)
-    if not info:
-        return "لا يوجد لديك اشتراك فعّال حالياً."
-    expires_at = info["expires_at"]
-    if expires_at.year > 2100:
-        return "لديك اشتراك دائم ✅"
-    return f"اشتراكك فعّال حتى: {expires_at.strftime('%Y-%m-%d %H:%M')} ✅"
-
-
-def stars_to_amount(stars: int) -> int:
-    """
-    قيمة الـ amount هي أقل وحدة للعملة.
-    لعملات الفيات هي مثلاً سنتات، للنجوم مافي توثيق رسمي واضح،
-    لكن عملياً نستخدم 100 * عدد النجوم، وغالباً رح تمشي.
-    لو عندك رقم محدد كنت تستخدمه قبل، عدّله هون.
-    """
-    return stars * 100
-
-
-# =========================
-# أوامر
-# =========================
-
-def start(update: Update, context: CallbackContext) -> None:
-    user = update.effective_user
-    logger.info("User %s started the bot", user.id)
-
-    text = (
-        "هلا حبيبي 👋\n\n"
-        "اختَر نوع الاشتراك اللي يناسبك من الأزرار تحت:\n"
-    )
-
-    sub_info = get_user_sub_info(user.id)
-    text += f"\n🔔 حالة اشتراكك:\n{sub_info}"
-
-    update.message.reply_text(text, reply_markup=build_main_menu())
-
-
-def admin_cmd(update: Update, context: CallbackContext) -> None:
-    user = update.effective_user
-    if not is_admin(user.id):
-        update.message.reply_text("ما إلك صلاحية تستخدم أمر /admin 👮‍♂️")
+def admin(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        update.message.reply_text("🚫 ما عندك صلاحية الدخول للوحة التحكم.")
         return
 
-    text = (
-        "لوحة تحكم الأدمن 👑\n\n"
-        "حالياً التعديل يكون من داخل الكود مباشرة.\n"
-        "الخطط الحالية:\n\n"
-    )
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 إحصائيات", callback_data="admin_stats"),
+        ],
+        [
+            InlineKeyboardButton("📄 قائمة المشتركين", callback_data="admin_list"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    for pid, p in PLANS.items():
-        text += f"- {p['name']}: {p['price_stars']} نجوم / {p['days']} يوم\n"
-
-    update.message.reply_text(text, reply_markup=build_main_menu())
+    update.message.reply_text("لوحة تحكم الأدمن:", reply_markup=reply_markup)
 
 
-# =========================
-# أزرار الإنلاين
-# =========================
-
-def handle_buttons(update: Update, context: CallbackContext) -> None:
+def admin_buttons(update: Update, context: CallbackContext):
     query = update.callback_query
-    user = query.from_user
-    data = query.data
+    user_id = query.from_user.id
+    data = load_data()
+
+    if not is_admin(user_id):
+        query.answer("ما عندك صلاحية.", show_alert=True)
+        return
+
     query.answer()
 
-    if data.startswith("plan:"):
-        plan_id = data.split(":", 1)[1]
-        plan = PLANS.get(plan_id)
-        if not plan:
-            query.edit_message_text("الخطة غير معروفة، حاول مرة ثانية.")
+    if query.data == "admin_stats":
+        total = len(data)
+        active = 0
+        now = datetime.utcnow()
+        for sub in data.values():
+            expires = sub.get("expires_at")
+            if not expires:
+                active += 1
+                continue
+            try:
+                dt = datetime.fromisoformat(expires)
+                if dt > now:
+                    active += 1
+            except Exception:
+                continue
+
+        text = (
+            "📊 إحصائيات الاشتراكات:\n\n"
+            f"إجمالي المستخدمين المسجلين: {total}\n"
+            f"اشتراكات فعّالة: {active}\n"
+        )
+        query.edit_message_text(text)
+
+    elif query.data == "admin_list":
+        if not data:
+            query.edit_message_text("ما في مشتركين مسجلين حالياً.")
             return
 
-        # تحضير الفاتورة
-        title = plan["name"]
-        description = f"وصول إلى القناة الخاصة لمدة {plan['days']} يوم."
-        payload = f"sub:{plan_id}"
-        currency = "XTR"  # عملة النجوم
-        prices = [LabeledPrice("Subscription", stars_to_amount(plan["price_stars"]))]
+        lines = ["📄 قائمة أول 50 مشترك:"]
+        now = datetime.utcnow()
+        for i, (uid, sub) in enumerate(data.items()):
+            if i >= 50:
+                lines.append("... الخ")
+                break
+            plan = PLANS.get(sub["plan"], {})
+            name = plan.get("name", sub["plan"])
+            expires = sub.get("expires_at")
+            status = "دائم"
+            if expires:
+                try:
+                    dt = datetime.fromisoformat(expires)
+                    status = dt.strftime("%Y-%m-%d")
+                    if dt < now:
+                        status += " (منتهي)"
+                except Exception:
+                    status = "غير معروف"
+            lines.append(f"- {uid} | {name} | ينتهي: {status}")
 
-        logger.info("Sending invoice to user %s for plan %s", user.id, plan_id)
+        query.edit_message_text("\n".join(lines))
+
+
+# ============== وظائف دورية ==============
+
+
+def check_expired(context: CallbackContext):
+    """تنفيذ دوري لحذف المشتركين المنتهين من القناة (لو أمكن)."""
+    bot: Bot = context.bot
+    data = load_data()
+    now = datetime.utcnow()
+    changed = False
+
+    for uid, sub in list(data.items()):
+        expires = sub.get("expires_at")
+        if not expires:
+            continue  # اشتراك دائم
 
         try:
-            context.bot.send_invoice(
-                chat_id=user.id,
-                title=title,
-                description=description,
-                payload=payload,
-                provider_token="",  # بتعامل مع Stars ببساطة، خليه فاضي
-                currency=currency,
-                prices=prices,
-            )
-            query.edit_message_text(
-                f"السعر: {plan['price_stars']} ⭐\n"
-                f"اضغط زر الدفع اللي رح يوصلك من تيليغرام لإكمال العملية."
-            )
-        except Exception as e:
-            logger.exception("Failed to send invoice: %s", e)
-            query.edit_message_text(
-                "صار خطأ أثناء إرسال الفاتورة. تأكد أن البوت مفعّل للمدفوعات،"
-                " أو جرّب بعدين."
-            )
+            dt = datetime.fromisoformat(expires)
+        except Exception:
+            continue
 
-    else:
-        query.edit_message_text("أمر غير معروف.")
+        if dt <= now:
+            user_id = int(uid)
+            logging.info("Subscription expired for %s", user_id)
+            # نحاول حذفه من القناة (لازم البوت يكون أدمن)
+            try:
+                bot.kick_chat_member(CHANNEL_ID, user_id)
+                bot.unban_chat_member(CHANNEL_ID, user_id)  # عشان يقدر يرجع لو اشترك من جديد
+            except Exception:
+                logging.exception("Failed to remove user %s from channel", user_id)
 
+            try:
+                bot.send_message(
+                    chat_id=user_id,
+                    text="⏰ انتهى اشتراكك في القناة الخاصة. تقدر تجدد عن طريق /start 🌟",
+                )
+            except Exception:
+                pass
 
-# =========================
-# الدفع
-# =========================
+            del data[uid]
+            changed = True
 
-def precheckout_callback(update: Update, context: CallbackContext) -> None:
-    """يتنادى قبل ما تيليغرام يكمّل عملية الدفع."""
-    query = update.pre_checkout_query
-    payload = query.invoice_payload or ""
-
-    if not payload.startswith("sub:"):
-        query.answer(ok=False, error_message="Payload غير معروف.")
-        return
-
-    # كلشي تمام
-    query.answer(ok=True)
+    if changed:
+        save_data(data)
 
 
-def successful_payment_handler(update: Update, context: CallbackContext) -> None:
-    """يتنادى بعد ما تيليغرام يأكد الدفع."""
-    message = update.message
-    user = message.from_user
-    payment = message.successful_payment
-
-    payload = payment.invoice_payload or ""
-    logger.info("Successful payment from %s with payload %s", user.id, payload)
-
-    if not payload.startswith("sub:"):
-        message.reply_text("تم الدفع، لكن لم أستطع تحديد الخطة. تواصل مع الأدمن.")
-        return
-
-    plan_id = payload.split(":", 1)[1]
-    plan = PLANS.get(plan_id)
-    if not plan:
-        message.reply_text("الخطة غير معروفة بعد الدفع. تواصل مع الأدمن.")
-        return
-
-    # حساب تاريخ الانتهاء
-    if plan_id == "lifetime":
-        expires_at = datetime(2999, 1, 1)  # عملياً دائم
-    else:
-        expires_at = datetime.utcnow() + timedelta(days=plan["days"])
-
-    user_subscriptions[user.id] = {
-        "plan_id": plan_id,
-        "expires_at": expires_at,
-    }
-
-    # إنشاء رابط دعوة للقناة
-    try:
-        # رابط مخصص لعضو واحد، يعني ما حدا غيره يدخل منه
-        invite_link = context.bot.create_chat_invite_link(
-            chat_id=CHANNEL_ID,
-            member_limit=1,
-            expire_date=None if plan_id == "lifetime" else int(expires_at.timestamp()),
-        )
-        link = invite_link.invite_link
-    except Exception as e:
-        logger.exception("Failed to create invite link: %s", e)
-        link = None
-
-    text = "✅ تم الدفع بنجاح!\n\n"
-    text += f"الخطة: {plan['name']} ({plan['price_stars']} ⭐)\n"
-
-    if plan_id == "lifetime":
-        text += "المدة: اشتراك دائم.\n"
-    else:
-        text += f"المدة: {plan['days']} يوم.\n"
-        text += f"تاريخ الانتهاء التقريبي: {expires_at.strftime('%Y-%m-%d %H:%M')} (UTC)\n"
-
-    if link:
-        text += f"\nرابط الدخول إلى القناة الخاصة:\n{link}\n\n"
-        text += "لا تشارك الرابط مع أحد، صالح لمرة واحدة فقط."
-    else:
-        text += (
-            "\n⚠️ تم الدفع لكن لم أستطع إنشاء رابط دعوة للقناة.\n"
-            "تواصل مع الأدمن لإكمال اشتراكك."
-        )
-
-    message.reply_text(text)
+# ============== تشغيل البوت ==============
 
 
-# =========================
-# الخطأ العام
-# =========================
-
-def error_handler(update: object, context: CallbackContext) -> None:
-    logger.warning("Update %s caused error %s", update, context.error)
-
-
-# =========================
-# main
-# =========================
-
-def main() -> None:
-    if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("انسخ توكن البوت الحقيقي داخل المتغير BOT_TOKEN قبل التشغيل.")
+def main():
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     # أوامر
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("admin", admin_cmd))
+    dp.add_handler(CommandHandler("admin", admin))
 
-    # أزرار الإنلاين
-    dp.add_handler(CallbackQueryHandler(handle_buttons))
+    # أزرار عادية
+    dp.add_handler(CallbackQueryHandler(button, pattern="^(plan_|my_status$)"))
+    dp.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_"))
 
     # الدفع
     dp.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     dp.add_handler(
-        MessageHandler(Filters.successful_payment, successful_payment_handler)
+        MessageHandler(Filters.successful_payment, successful_payment)
     )
 
-    # لوج للأخطاء
-    dp.add_error_handler(error_handler)
+    # وظيفة دورية لفحص الاشتراكات المنتهية كل ساعة
+    job_queue = updater.job_queue
+    job_queue.run_repeating(check_expired, interval=3600, first=3600)
 
-    logger.info("Bot is starting...")
+    logging.info("Bot is starting...")
     updater.start_polling()
     updater.idle()
 
 
 if __name__ == "__main__":
     main()
-
-
