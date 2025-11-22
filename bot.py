@@ -24,7 +24,7 @@ from telegram.ext import (
 # =========================
 
 # حط توكن البوت تبعك هون
-BOT_TOKEN = "8307758081:AAFTrGOJAi_on0koLNkqNVJ5kIU_LI788KM"
+BOT_TOKEN = "8307758081:AAGRFcucb0XLWe6TEJAOX0qFFlMFYBpKSYY"
 
 # ID القناة الخاصة اللي بدك تبعت منها رابط الدعوة (لازم البوت يكون أدمن فيها)
 # مثال: -1001234567890
@@ -322,3 +322,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
