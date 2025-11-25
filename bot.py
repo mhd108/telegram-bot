@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import os
 from datetime import datetime, timedelta
+from typing import Dict, Any
 
 from telegram import (
     Update,
@@ -10,31 +12,47 @@ from telegram import (
     LabeledPrice,
 )
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    Filters,
     PreCheckoutQueryHandler,
-    CallbackContext,
+    ContextTypes,
+    JobQueue,
+    filters,
 )
 
-# ================== إعدادات أساسية ==================
+# =========================
+# إعدادات أساسية
+# =========================
 
-# حط توكن البوت تبعك هون
-BOT_TOKEN = "8307758081:AAGRFcucb0XLWe6TEJAOX0qFFlMFYBpKSYY"
+# توكن البوت
+BOT_TOKEN = "8307758081:AAGRFcucb0XLWe6TEJAOX0qFFlMFYBpKSYY"  # <-- عدّلها
 
-# ID القناة الخاصة اللي بدك تبعت لها الدعوات (لازم يكون البوت أدمن فيها)
-# مثال: -1001234567890
-CHANNEL_ID = -1002547907056
+# آيدي القناة الخاصة (سالب مثل: -100xxxxxxxxxx)
+CHANNEL_ID = -1002547907056            # <-- عدّلها
 
-# أرقام الـ user_id للأدمنات المسموح لهم يدخلوا لوحة التحكم
-ADMIN_IDS = {6671972850}  # عدّل الرقم لرقمك انت
+# آي دي الأدمن (ممكن أكثر من واحد)
+ADMIN_IDS = {6671972850}               # <-- عدّلها
 
-# ملف تخزين الخطط (يتخزن على السيرفر، رح يروح لو عملت Deploy جديد)
-PLANS_FILE = "plans.json"
+# ملفات التخزين
+PLANS_FILE = "plans.json"          # تخزين الباقات
+SUBS_FILE = "subscriptions.json"   # تخزين الاشتراكات
 
-# إعداد اللوجينغ
+# باقات افتراضية أول تشغيل (تقدر تعدلها / تحذفها لاحقاً من داخل /admin)
+DEFAULT_PLANS: Dict[str, Dict[str, Any]] = {
+    "اشتراك أسبوعي": {"price": 100, "days": 7, "description": "وصول لمدة 7 أيام"},
+    "اشتراك شهري": {"price": 300, "days": 30, "description": "وصول لمدة شهر"},
+    "اشتراك دائم": {"price": 1000, "days": 3650, "description": "وصول طويل المدى"},
+}
+
+# كل كم ثانية يفحص انتهاء الاشتراكات (هنا كل ساعة)
+CHECK_INTERVAL_SECONDS = 3600
+
+# =========================
+# لوق
+# =========================
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -42,552 +60,523 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ================== تخزين و تحميل الخطط ==================
+# =========================
+# دوال مساعدة - الباقات
+# =========================
 
-def load_plans():
+def load_plans() -> Dict[str, Dict[str, Any]]:
+    if not os.path.exists(PLANS_FILE):
+        save_plans(DEFAULT_PLANS)
+        return DEFAULT_PLANS.copy()
     try:
         with open(PLANS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("plans", {})
-    except FileNotFoundError:
-        # أول تشغيل: نحط شوية خطط افتراضية
-        plans = {
-            "plan1": {"title": "اشتراك أسبوعي", "price_stars": 10, "days": 7},
-            "plan2": {"title": "اشتراك شهري", "price_stars": 25, "days": 30},
-            "plan3": {"title": "اشتراك دائم", "price_stars": 60, "days": 0},
-        }
-        save_plans(plans)
-        return plans
+            return json.load(f)
     except Exception:
         logger.exception("Failed to load plans file")
         return {}
 
 
-def save_plans(plans):
+def save_plans(plans: Dict[str, Dict[str, Any]]) -> None:
     try:
         with open(PLANS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"plans": plans}, f, ensure_ascii=False, indent=2)
+            json.dump(plans, f, ensure_ascii=False, indent=2)
     except Exception:
         logger.exception("Failed to save plans file")
 
 
-def generate_plan_id(plans):
-    """نعطي ID جديد تلقائي للزر الجديد."""
-    i = 1
-    while True:
-        pid = f"plan{i}"
-        if pid not in plans:
-            return pid
-        i += 1
+# =========================
+# دوال مساعدة - الاشتراكات
+# =========================
+
+def load_subs() -> Dict[str, Dict[str, Any]]:
+    if not os.path.exists(SUBS_FILE):
+        return {}
+    try:
+        with open(SUBS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.exception("Failed to load subs file")
+        return {}
 
 
-def stars_to_amount(stars: int) -> int:
-    """
-    amount للنجوم لازم يكون مضروب بـ 100 حسب عملة XTR.
-    يعني لو بدك 10 نجوم → amount = 1000
-    """
-    return stars * 100
+def save_subs(subs: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        with open(SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(subs, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Failed to save subs file")
+
+
+def format_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ================== أوامر المستخدم ==================
+# =========================
+# أمر /start للمستخدم
+# =========================
 
-def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    plans = load_plans()
+    subs = load_subs()
+    user_info = subs.get(str(user.id))
 
-    if not plans:
-        update.message.reply_text("ما في خطط حالياً. تواصل مع الأدمن.")
-        return
-
-    keyboard = []
-    for pid, p in plans.items():
-        title = p.get("title", "خطة بدون اسم")
-        price = p.get("price_stars", 0)
-        keyboard.append(
-            [InlineKeyboardButton(f"{title} ⭐{price}", callback_data=f"user_plan:{pid}")]
-        )
+    if user_info:
+        try:
+            expires_at = datetime.fromisoformat(user_info["expires_at"])
+            status = (
+                f"✅ عندك اشتراك فعال حتى: <b>{format_dt(expires_at)} UTC</b>\n\n"
+            )
+        except Exception:
+            status = "✅ عندك اشتراك مسجل، لكن تاريخ الانتهاء غير واضح.\n\n"
+    else:
+        status = "❌ ما عندك اشتراك فعال حالياً.\n\n"
 
     text = (
-        f"هلا {user.first_name or ''} 👋\n\n"
-        "اختر نوع الاشتراك اللي يناسبك من الأزرار تحت.\n"
+        f"هلا {user.first_name} 👋\n\n"
+        + status
+        + "اضغط الزر تحت لعرض الباقات المتاحة:"
     )
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text(text, reply_markup=reply_markup)
-
-
-def user_plan_button(update: Update, context: CallbackContext):
-    query = update.callback_query
-    user = query.from_user
-    plans = load_plans()
-
-    query.answer()
-
-    _, pid = query.data.split(":", 1)
-    plan = plans.get(pid)
-    if not plan:
-        query.edit_message_text("الخطة غير موجودة (يمكن الأدمن حذفها).")
-        return
-
-    title = plan["title"]
-    price = plan["price_stars"]
-    days = plan["days"]
-
-    desc = f"اشتراك: {title}\nالسعر: ⭐ {price}\n"
-    if days == 0:
-        desc += "المدة: دائم.\n"
-    else:
-        desc += f"المدة: {days} يوم.\n"
 
     keyboard = [
-        [InlineKeyboardButton(f"ادفع ⭐ {price}", callback_data=f"user_pay:{pid}")],
-        [InlineKeyboardButton("رجوع للقائمة", callback_data="user_back")],
+        [InlineKeyboardButton("📦 عرض الباقات", callback_data="user:show_plans")]
     ]
-
-    query.edit_message_text(desc, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-def user_back(update: Update, context: CallbackContext):
-    # رجوع لقائمة الخطط
-    query = update.callback_query
-    query.answer()
-    fake_update = Update(
-        update.update_id,
-        message=query.message,
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
-    start(fake_update, context)
 
 
-def user_pay_button(update: Update, context: CallbackContext):
+# =========================
+# عرض الباقات للمستخدم
+# =========================
+
+async def user_show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    user = query.from_user
-    plans = load_plans()
-    query.answer()
+    await query.answer()
 
-    _, pid = query.data.split(":", 1)
-    plan = plans.get(pid)
-    if not plan:
-        query.edit_message_text("الخطة غير موجودة.")
+    plans = load_plans()
+    if not plans:
+        await query.edit_message_text("🚫 لا توجد أي باقات متاحة حالياً.")
         return
 
-    title = plan["title"]
-    price_stars = plan["price_stars"]
+    lines = []
+    keyboard = []
+    for name, info in plans.items():
+        price = info.get("price", 0)
+        days = info.get("days", 0)
+        desc = info.get("description", "")
+        duration_txt = "دائم" if days == 0 else f"{days} يوم"
+        lines.append(f"• <b>{name}</b> – {duration_txt} – ⭐ {price}\n  <i>{desc}</i>")
+        keyboard.append(
+            [InlineKeyboardButton(f"{name} – ⭐{price}", callback_data=f"buy:{name}")]
+        )
 
-    context.bot.send_invoice(
-        chat_id=user.id,
-        title=title,
-        description=f"اشتراك {title} في القناة الخاصة.",
-        payload=f"sub:{pid}",
-        provider_token="",  # للنجوم نخليه فاضي
+    text = "اختر الباقة اللي تناسبك 👇\n\n" + "\n".join(lines)
+
+    await query.edit_message_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================
+# إنشاء فاتورة Telegram Stars
+# =========================
+
+async def buy_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    _, plan_name = data.split(":", 1)
+
+    plans = load_plans()
+    plan = plans.get(plan_name)
+    if not plan:
+        await query.edit_message_text("🚫 هذه الباقة لم تعد متاحة.")
+        return
+
+    price_stars = int(plan.get("price", 0))
+    description = plan.get("description", "اشتراك في القناة الخاصة")
+
+    # Telegram Stars: currency=XTR و amount = عدد النجوم
+    prices = [LabeledPrice(label=plan_name, amount=price_stars)]
+    payload = f"stars:{plan_name}:{price_stars}"
+
+    await context.bot.send_invoice(
+        chat_id=query.from_user.id,
+        title=f"اشتراك – {plan_name}",
+        description=description,
+        payload=payload,
+        provider_token="",  # فارغ مع Telegram Stars
         currency="XTR",
-        prices=[LabeledPrice(title, stars_to_amount(price_stars))],
+        prices=prices,
+        max_tip_amount=0,
+        need_name=False,
+        need_phone_number=False,
+        need_email=False,
+        need_shipping_address=False,
+        is_flexible=False,
     )
 
-    query.edit_message_text(
-        f"السعر: ⭐ {price_stars}\n"
-        "رح يوصلك إشعار دفع من تيليجرام، وافق عليه لإكمال الاشتراك."
+    await query.edit_message_text(
+        f"تم إنشاء طلب الاشتراك: <b>{plan_name}</b>\n"
+        f"السعر: ⭐ {price_stars}\n\n"
+        "رح يوصلك واجهة الدفع من تيليغرام، ادفع و انتظر تفعيل الاشتراك 👌",
+        parse_mode="HTML",
     )
 
 
-# ================== الدفع بالنجوم ==================
+# =========================
+# معالجة pre_checkout
+# =========================
 
-def precheckout_handler(update: Update, context: CallbackContext):
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    if not query.invoice_payload.startswith("sub:"):
-        query.answer(ok=False, error_message="نوع الدفع غير معروف.")
-        return
-    query.answer(ok=True)
-
-
-def successful_payment_handler(update: Update, context: CallbackContext):
-    msg = update.message
-    user = msg.from_user
-    payment = msg.successful_payment
-    payload = payment.invoice_payload
-
-    if not payload.startswith("sub:"):
-        msg.reply_text("وصل دفع غير معروف. تواصل مع الأدمن.")
-        return
-
-    _, pid = payload.split(":", 1)
-    plans = load_plans()
-    plan = plans.get(pid)
-    if not plan:
-        msg.reply_text("الخطة غير موجودة بعد الدفع، تواصل مع الأدمن.")
-        return
-
-    title = plan["title"]
-    price = plan["price_stars"]
-    days = plan["days"]
-
-    # نحاول نعمل رابط دعوة واحد
     try:
-        invite = context.bot.create_chat_invite_link(
+        if not query.invoice_payload.startswith("stars:"):
+            await query.answer(ok=False, error_message="Payload غير معروف.")
+            return
+        await query.answer(ok=True)
+    except Exception as e:
+        logger.error("Error in precheckout: %s", e)
+        await query.answer(ok=False, error_message="صار خطأ، جرّب مرة ثانية.")
+
+
+# =========================
+# بعد الدفع الناجح
+# =========================
+
+async def successful_payment_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    payment = update.message.successful_payment
+    user = update.effective_user
+
+    payload = payment.invoice_payload or ""
+    try:
+        _, plan_name, price_str = payload.split(":", 2)
+        price_stars = int(price_str)
+    except Exception:
+        plan_name = "باقتك"
+        price_stars = payment.total_amount
+
+    plans = load_plans()
+    plan = plans.get(plan_name)
+    if not plan:
+        # في حال الباقة اختفت من الملف بعد الدفع
+        plan = {"days": 0, "description": ""}
+
+    days = int(plan.get("days", 0))
+    now = datetime.utcnow()
+
+    if days == 0:
+        # دائم (نخلي التاريخ بعيد)
+        expires_at = now + timedelta(days=3650)
+    else:
+        expires_at = now + timedelta(days=days)
+
+    # إنشاء رابط دعوة للقناة
+    try:
+        invite = await context.bot.create_chat_invite_link(
             chat_id=CHANNEL_ID,
             member_limit=1,
         )
-        link = invite.invite_link
+        invite_link = invite.invite_link
     except Exception as e:
-        logger.exception("Failed to create invite link: %s", e)
-        link = None
+        logger.error("Error creating invite link: %s", e)
+        invite_link = None
 
-    text = [
-        "✅ تم الدفع بنجاح!",
-        f"الخطة: {title}",
-        f"السعر: ⭐ {price}",
+    # حفظ الاشتراك
+    subs = load_subs()
+    subs[str(user.id)] = {
+        "plan": plan_name,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    save_subs(subs)
+
+    lines = [
+        "✅ تم الدفع بنجاح، يعطيك العافية!",
+        f"📦 الباقة: <b>{plan_name}</b>",
+        f"⭐ المبلغ المدفوع: {price_stars} نجمة",
+        f"⏰ انتهاء الاشتراك (تقديرياً): <b>{format_dt(expires_at)} UTC</b>",
+        "",
     ]
-    if days == 0:
-        text.append("المدة: دائم.")
+
+    if invite_link:
+        lines.append("🔗 رابط الدخول للقناة الخاصة (اضغط للدخول):")
+        lines.append(invite_link)
+        lines.append("")
+        lines.append("📌 الرابط صالح لدخول واحد فقط، لا تشاركه مع أحد.")
     else:
-        text.append(f"المدة: {days} يوم تقريباً من وقت الدفع.")
+        lines.append("⚠ تم الدفع لكن ما قدرت أجهّز رابط دعوة للقناة.")
+        lines.append("تواصل مع الأدمن لإكمال الاشتراك.")
 
-    if link:
-        text.append("")
-        text.append("🎁 رابط الدخول للقناة الخاصة:")
-        text.append(link)
-    else:
-        text.append("")
-        text.append("⚠ تم الدفع لكن ما قدرت أجهز رابط الدعوة.")
-        text.append("تواصل مع الأدمن لإكمال الاشتراك.")
-
-    msg.reply_text("\n".join(text))
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
 
 
-# ================== لوحة تحكم الأدمن ==================
+# =========================
+# لوحة تحكم الأدمن بالأزرار
+# =========================
 
-def admin_cmd(update: Update, context: CallbackContext):
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        update.message.reply_text("ما عندك صلاحية تفتح لوحة الأدمن 🚫")
         return
 
-    show_admin_main(update, context)
-
-
-def show_admin_main(update_or_query, context: CallbackContext):
-    if isinstance(update_or_query, Update) and update_or_query.message:
-        send_func = update_or_query.message.reply_text
-    else:
-        q = update_or_query.callback_query
-        send_func = q.edit_message_text
-
     keyboard = [
-        [InlineKeyboardButton("📋 عرض الخطط", callback_data="admin:list")],
-        [InlineKeyboardButton("➕ إضافة خطة جديدة", callback_data="admin:add")],
+        [InlineKeyboardButton("📦 عرض الباقات", callback_data="admin:show_plans")],
+        [InlineKeyboardButton("➕ إضافة/تعديل باقة", callback_data="admin:add_plan")],
+        [InlineKeyboardButton("🗑 حذف باقة", callback_data="admin:del_plan")],
+        [InlineKeyboardButton("👥 عرض المشتركين", callback_data="admin:subs")],
     ]
-    send_func("لوحة تحكم الأدمن 👇", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    text = (
+        "🛠 لوحة تحكم الأدمن\n\n"
+        "➕ لإضافة/تعديل باقة: بعد الضغط على الزر، أرسل رسالة بالشكل:\n"
+        "<code>اسم الباقة,السعر بالنجوم,عدد الأيام,وصف اختياري</code>\n"
+        "مثال:\n"
+        "<code>VIP أسبوعي,200,7,اشتراك أسبوعي مميز</code>\n\n"
+        "🗑 لحذف باقة: اضغط الزر ثم أرسل اسم الباقة بالضبط.\n"
+    )
+
+    await update.effective_message.reply_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
-def admin_callback(update: Update, context: CallbackContext):
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    await query.answer()
     user_id = query.from_user.id
-
     if not is_admin(user_id):
-        query.answer("ما عندك صلاحية.", show_alert=True)
+        await query.edit_message_text("🚫 ما عندك صلاحية.")
         return
 
     data = query.data
     plans = load_plans()
-    query.answer()
 
-    # القائمة الرئيسية
-    if data == "admin:main":
-        show_admin_main(update, context)
-        return
-
-    # عرض الخطط
-    if data == "admin:list":
+    # عرض الباقات
+    if data == "admin:show_plans":
         if not plans:
-            query.edit_message_text(
-                "ما في أي خطة حالياً.\n"
-                "ضيف خطة جديدة من زر (إضافة خطة جديدة)."
-            )
+            await query.edit_message_text("🚫 لا توجد أي باقات حالياً.")
             return
-
-        lines = ["📋 الخطط الحالية:\n"]
-        keyboard = []
-        for pid, p in plans.items():
-            title = p.get("title", "بدون اسم")
-            price = p.get("price_stars", 0)
-            days = p.get("days", 0)
+        lines = []
+        for name, info in plans.items():
+            price = info.get("price", 0)
+            days = info.get("days", 0)
+            desc = info.get("description", "")
             dur = "دائم" if days == 0 else f"{days} يوم"
-            lines.append(f"- {pid}: {title} | ⭐{price} | {dur}")
-            keyboard.append(
-                [InlineKeyboardButton(f"تعديل: {title}", callback_data=f"admin:edit:{pid}")]
+            lines.append(
+                f"• <b>{name}</b> – ⭐{price} – {dur}\n  <i>{desc}</i>"
             )
-
-        keyboard.append(
-            [InlineKeyboardButton("⬅ رجوع", callback_data="admin:main")]
+        await query.edit_message_text(
+            "📦 الباقات الحالية:\n\n" + "\n".join(lines),
+            parse_mode="HTML",
         )
 
-        query.edit_message_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard),
+    # وضع إضافة/تعديل باقة
+    elif data == "admin:add_plan":
+        context.user_data["admin_mode"] = "add_plan"
+        await query.edit_message_text(
+            "أرسل الآن رسالة بصيغة:\n\n"
+            "<code>اسم الباقة,السعر بالنجوم,عدد الأيام,وصف اختياري</code>\n"
+            "مثال:\n"
+            "<code>اشتراك أسبوعي,100,7,وصول لمدة أسبوع</code>",
+            parse_mode="HTML",
         )
-        return
 
-    # إضافة خطة جديدة (نبدأ بالمرحلة الأولى)
-    if data == "admin:add":
-        context.user_data.clear()
-        context.user_data["admin_mode"] = "create_title"
-        query.edit_message_text(
-            "🆕 إنشاء خطة جديدة:\n\n"
-            "اكتب الآن اسم الزر / الخطة (مثال: اشتراك ٣ أيام)."
+    # وضع حذف باقة
+    elif data == "admin:del_plan":
+        context.user_data["admin_mode"] = "del_plan"
+        await query.edit_message_text(
+            "أرسل اسم الباقة اللي تبي تحذفها بالضبط.\n\nمثال:\n"
+            "<code>اشتراك أسبوعي</code>",
+            parse_mode="HTML",
         )
-        return
 
-    # تعديل خطة معيّنة
-    if data.startswith("admin:edit:"):
-        _, _, pid = data.split(":", 2)
-        plan = plans.get(pid)
-        if not plan:
-            query.edit_message_text("الخطة غير موجودة.")
+    # عرض المشتركين
+    elif data == "admin:subs":
+        subs = load_subs()
+        if not subs:
+            await query.edit_message_text("👥 لا يوجد مشتركين مسجلين حالياً.")
             return
-
-        title = plan.get("title", "بدون اسم")
-        price = plan.get("price_stars", 0)
-        days = plan.get("days", 0)
-        dur = "دائم" if days == 0 else f"{days} يوم"
-
-        text = (
-            f"تعديل الخطة: {pid}\n\n"
-            f"الاسم الحالي: {title}\n"
-            f"السعر الحالي: ⭐{price}\n"
-            f"المدة الحالية: {dur}\n\n"
-            "اختر ما تريد تعديله:"
+        lines = []
+        now = datetime.utcnow()
+        for uid, info in subs.items():
+            plan_name = info.get("plan", "?")
+            try:
+                exp = datetime.fromisoformat(info["expires_at"])
+                status = "✅ فعال" if exp > now else "⛔ منتهي"
+                lines.append(
+                    f"• ID {uid} – {plan_name} – ينتهي {format_dt(exp)} UTC – {status}"
+                )
+            except Exception:
+                lines.append(f"• ID {uid} – {plan_name} – تاريخ غير معروف")
+        await query.edit_message_text(
+            "👥 المشتركين:\n\n" + "\n".join(lines),
+            parse_mode="HTML",
         )
 
-        keyboard = [
-            [InlineKeyboardButton("✏ تغيير الاسم", callback_data=f"admin:edit_title:{pid}")],
-            [InlineKeyboardButton("💰 تغيير السعر", callback_data=f"admin:edit_price:{pid}")],
-            [InlineKeyboardButton("⏱ تغيير المدة", callback_data=f"admin:edit_days:{pid}")],
-            [InlineKeyboardButton("🗑 حذف الخطة", callback_data=f"admin:delete:{pid}")],
-            [InlineKeyboardButton("⬅ رجوع", callback_data="admin:list")],
-        ]
 
-        query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
+# =========================
+# استقبال نصوص الأدمن (إضافة/حذف)
+# =========================
 
-    # حذف خطة
-    if data.startswith("admin:delete:"):
-        _, _, pid = data.split(":", 2)
-        if pid in plans:
-            del plans[pid]
-            save_plans(plans)
-            query.edit_message_text("✅ تم حذف الخطة.")
-        else:
-            query.edit_message_text("الخطة غير موجودة.")
-        return
-
-    # تغيير الاسم
-    if data.startswith("admin:edit_title:"):
-        _, _, pid = data.split(":", 2)
-        if pid not in plans:
-            query.edit_message_text("الخطة غير موجودة.")
-            return
-
-        context.user_data["admin_mode"] = "edit_title"
-        context.user_data["edit_pid"] = pid
-        query.edit_message_text(
-            f"✏ أرسل الاسم الجديد للخطة:\n(current: {plans[pid]['title']})"
-        )
-        return
-
-    # تغيير السعر
-    if data.startswith("admin:edit_price:"):
-        _, _, pid = data.split(":", 2)
-        if pid not in plans:
-            query.edit_message_text("الخطة غير موجودة.")
-            return
-
-        context.user_data["admin_mode"] = "edit_price"
-        context.user_data["edit_pid"] = pid
-        query.edit_message_text(
-            f"💰 أرسل السعر الجديد بالنجوم (رقم فقط):\n(current: {plans[pid]['price_stars']})"
-        )
-        return
-
-    # تغيير المدة
-    if data.startswith("admin:edit_days:"):
-        _, _, pid = data.split(":", 2)
-        if pid not in plans:
-            query.edit_message_text("الخطة غير موجودة.")
-            return
-
-        context.user_data["admin_mode"] = "edit_days"
-        context.user_data["edit_pid"] = pid
-        query.edit_message_text(
-            f"⏱ أرسل المدة الجديدة بالأيام (0 = دائم):\n(current: {plans[pid]['days']})"
-        )
-        return
-
-
-def admin_text_handler(update: Update, context: CallbackContext):
-    """هاندلر لنصوص الأدمن لما نكون بوضع تعديل/إضافة."""
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
 
-    text = update.message.text.strip()
     mode = context.user_data.get("admin_mode")
-    plans = load_plans()
-
-    # ما في مود شغّال
     if not mode:
         return
 
-    # إنشاء خطة جديدة - الخطوة 1 (الاسم)
-    if mode == "create_title":
-        context.user_data["new_plan_title"] = text
-        context.user_data["admin_mode"] = "create_price"
-        update.message.reply_text(
-            f"الاسم: {text}\n\n"
-            "💰 أرسل الآن السعر بالنجوم (رقم فقط، مثال: 10)."
-        )
-        return
+    text = update.message.text.strip()
+    plans = load_plans()
 
-    # إنشاء خطة جديدة - الخطوة 2 (السعر)
-    if mode == "create_price":
-        try:
-            price = int(text)
-        except ValueError:
-            update.message.reply_text("⚠ السعر لازم يكون رقم صحيح. جرّب مرة ثانية.")
+    # إضافة أو تعديل باقة
+    if mode == "add_plan":
+        # صيغة: اسم,سعر,أيام,وصف اختياري
+        parts = [p.strip() for p in text.split(",", 3)]
+        if len(parts) < 3:
+            await update.message.reply_text(
+                "❌ الصيغة غير صحيحة.\n"
+                "استخدم:\n"
+                "<code>اسم الباقة,السعر بالنجوم,عدد الأيام,وصف اختياري</code>",
+                parse_mode="HTML",
+            )
             return
-
-        context.user_data["new_plan_price"] = price
-        context.user_data["admin_mode"] = "create_days"
-        update.message.reply_text(
-            f"السعر: ⭐{price}\n\n"
-            "⏱ أرسل الآن المدة بالأيام (0 = دائم)."
-        )
-        return
-
-    # إنشاء خطة جديدة - الخطوة 3 (الأيام)
-    if mode == "create_days":
+        name = parts[0]
         try:
-            days = int(text)
+            price = int(parts[1])
+            days = int(parts[2])
         except ValueError:
-            update.message.reply_text("⚠ المدة لازم تكون رقم. جرّب مرة ثانية.")
+            await update.message.reply_text("❌ السعر والأيام لازم يكونوا أرقام.")
             return
+        if len(parts) == 4:
+            desc = parts[3]
+        else:
+            desc = f"اشتراك {name}"
 
-        title = context.user_data.get("new_plan_title", "خطة بدون اسم")
-        price = context.user_data.get("new_plan_price", 0)
-
-        pid = generate_plan_id(plans)
-        plans[pid] = {
-            "title": title,
-            "price_stars": price,
-            "days": max(days, 0),
-        }
+        plans[name] = {"price": price, "days": days, "description": desc}
         save_plans(plans)
 
-        context.user_data.clear()
-
-        update.message.reply_text(
-            "✅ تم إنشاء الخطة الجديدة:\n\n"
-            f"ID: {pid}\n"
-            f"الاسم: {title}\n"
+        await update.message.reply_text(
+            f"✅ تم حفظ الباقة:\n"
+            f"الاسم: {name}\n"
             f"السعر: ⭐{price}\n"
-            f"المدة: {'دائم' if days == 0 else str(days) + ' يوم'}"
+            f"المدة: {days} يوم\n"
+            f"الوصف: {desc}"
         )
-        return
+        context.user_data["admin_mode"] = None
 
-    # تعديل اسم خطة
-    if mode == "edit_title":
-        pid = context.user_data.get("edit_pid")
-        if not pid or pid not in plans:
-            update.message.reply_text("الخطة غير موجودة.")
-        else:
-            plans[pid]["title"] = text
-            save_plans(plans)
-            update.message.reply_text(
-                f"✅ تم تغيير اسم الخطة ({pid}) إلى: {text}"
-            )
-        context.user_data.clear()
-        return
-
-    # تعديل سعر خطة
-    if mode == "edit_price":
-        pid = context.user_data.get("edit_pid")
-        try:
-            price = int(text)
-        except ValueError:
-            update.message.reply_text("⚠ السعر لازم يكون رقم. جرّب مرة ثانية.")
+    # حذف باقة
+    elif mode == "del_plan":
+        name = text
+        if name not in plans:
+            await update.message.reply_text("❌ لا توجد باقة بهذا الاسم.")
             return
+        del plans[name]
+        save_plans(plans)
+        await update.message.reply_text(f"🗑 تم حذف الباقة: {name}")
+        context.user_data["admin_mode"] = None
 
-        if not pid or pid not in plans:
-            update.message.reply_text("الخطة غير موجودة.")
-        else:
-            plans[pid]["price_stars"] = price
-            save_plans(plans)
-            update.message.reply_text(
-                f"✅ تم تغيير السعر للخطة ({pid}) إلى ⭐{price}"
-            )
-        context.user_data.clear()
-        return
 
-    # تعديل مدة خطة
-    if mode == "edit_days":
-        pid = context.user_data.get("edit_pid")
+# =========================
+# Job لفحص انتهاء الاشتراكات
+# =========================
+
+async def check_expired(context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Running expiration check job...")
+    subs = load_subs()
+    now = datetime.utcnow()
+    changed = False
+
+    for uid_str, info in list(subs.items()):
         try:
-            days = int(text)
-        except ValueError:
-            update.message.reply_text("⚠ المدة لازم تكون رقم. جرّب مرة ثانية.")
-            return
+            exp = datetime.fromisoformat(info["expires_at"])
+        except Exception:
+            continue
 
-        if not pid or pid not in plans:
-            update.message.reply_text("الخطة غير موجودة.")
-        else:
-            plans[pid]["days"] = max(days, 0)
-            save_plans(plans)
-            update.message.reply_text(
-                f"✅ تم تغيير المدة للخطة ({pid}) إلى: "
-                f"{'دائم' if days == 0 else str(days) + ' يوم'}"
-            )
-        context.user_data.clear()
-        return
+        if now >= exp:
+            user_id = int(uid_str)
+            logger.info("Subscription expired for user %s", user_id)
+            # طرد العضو من القناة
+            try:
+                await context.bot.ban_chat_member(CHANNEL_ID, user_id)
+                await context.bot.unban_chat_member(CHANNEL_ID, user_id)
+            except Exception as e:
+                logger.warning("Error kicking user %s: %s", user_id, e)
+
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⏰ انتهى اشتراكك في القناة. إذا حابب تجدد، اكتب /start واختر باقة جديدة 💜",
+                )
+            except Exception:
+                pass
+
+            del subs[uid_str]
+            changed = True
+
+    if changed:
+        save_subs(subs)
+        logger.info("Expired subs cleaned.")
 
 
-# ================== تشغيل البوت ==================
+# =========================
+# main
+# =========================
 
-def main():
-    if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("حط توكن البوت الحقيقي في BOT_TOKEN قبل التشغيل.")
+def main() -> None:
+    if BOT_TOKEN.startswith("PUT_") or not BOT_TOKEN:
+        raise RuntimeError("رجاءً عدّل BOT_TOKEN و CHANNEL_ID و ADMIN_IDS في أعلى الملف.")
 
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    # أوامر
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("admin", admin_cmd))
+    # أوامر المستخدم
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_cmd))
 
     # أزرار المستخدم
-    dp.add_handler(CallbackQueryHandler(user_plan_button, pattern=r"^user_plan:"))
-    dp.add_handler(CallbackQueryHandler(user_pay_button, pattern=r"^user_pay:"))
-    dp.add_handler(CallbackQueryHandler(user_back, pattern=r"^user_back$"))
+    application.add_handler(
+        CallbackQueryHandler(user_show_plans, pattern=r"^user:show_plans$")
+    )
+    application.add_handler(CallbackQueryHandler(buy_plan, pattern=r"^buy:"))
 
-    # أزرار الأدمن
-    dp.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
-
-    # نصوص الأدمن (إضافة/تعديل خطط)
-    dp.add_handler(
-        MessageHandler(Filters.text & Filters.private & ~Filters.command, admin_text_handler)
+    # الدفع بالنجوم
+    application.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    application.add_handler(
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
     )
 
-    # الدفع
-    dp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    dp.add_handler(MessageHandler(Filters.successful_payment, successful_payment_handler))
+    # أزرار الأدمن
+    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
 
-    logger.info("Bot is starting with dynamic admin panel…")
-    updater.start_polling()
-    updater.idle()
+    # نصوص الأدمن (إضافة/حذف باقات)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.User(list(ADMIN_IDS)),
+            admin_text,
+        )
+    )
+
+    # Job لفحص انتهاء الاشتراكات
+    job_queue: JobQueue = application.job_queue
+    job_queue.run_repeating(
+        check_expired, interval=CHECK_INTERVAL_SECONDS, first=CHECK_INTERVAL_SECONDS
+    )
+
+    logger.info("Bot is starting...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
